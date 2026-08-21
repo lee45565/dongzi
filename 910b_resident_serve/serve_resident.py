@@ -64,25 +64,16 @@ def _worker_env(rank: int, world_size: int, master_addr: str, master_port: str) 
     os.environ.setdefault("YOLO_OFFLINE", "1")
 
 
-def _init_npu(rank: int, world_size: int):
+def _init_npu(rank: int):
+    """Bind this spawn worker to its NPU. Do not init HCCL here — LightX2V
+    create_generator() → init_parallel_env() owns dist.init_process_group."""
     import torch
     import torch_npu  # noqa: F401
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
     if hasattr(torch, "npu"):
         torch.npu.set_device(rank)
-        # Do not override motion_control.py's allow_internal_format here.
-
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="hccl",
-            rank=rank,
-            world_size=world_size,
-            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-        )
-    return torch, dist
+    return torch
 
 
 def _build_engine(config_yaml: str, extra_args: list[str], keep_sam3: bool) -> Any:
@@ -134,12 +125,18 @@ def worker_main(
         worker_args["master_port"],
     )
     try:
-        torch, dist = _init_npu(rank, world_size)
+        _init_npu(rank)
         engine = _build_engine(
             worker_args["config_yaml"],
             worker_args.get("extra_args") or [],
             keep_sam3=bool(worker_args.get("keep_sam3", True)),
         )
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                f"rank{rank}: LightX2V did not init process group (WORLD_SIZE={os.environ.get('WORLD_SIZE')})"
+            )
         dist.barrier()
         ready_queue.put(
             {
