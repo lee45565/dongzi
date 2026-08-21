@@ -71,12 +71,7 @@ def _init_npu(rank: int, world_size: int):
 
     if hasattr(torch, "npu"):
         torch.npu.set_device(rank)
-        try:
-            # NZ / internal format: large MatMul win on 910B.
-            if hasattr(torch.npu, "config"):
-                torch.npu.config.allow_internal_format = True
-        except Exception:
-            pass
+        # Do not override motion_control.py's allow_internal_format here.
 
     import torch.distributed as dist
 
@@ -90,33 +85,8 @@ def _init_npu(rank: int, world_size: int):
     return torch, dist
 
 
-def _maybe_keep_sam3(engine: Any, keep_sam3: bool) -> None:
-    """Resident mode: do not destroy SAM3 weights between requests."""
-    if not keep_sam3:
-        return
-    orig = getattr(engine, "_release_sam3_npu", None)
-    if orig is None:
-        return
-
-    def _release_keep_weights(*_a, **_k):
-        try:
-            import gc
-            import torch
-
-            gc.collect()
-            if hasattr(torch, "npu"):
-                torch.npu.empty_cache()
-        except Exception:
-            pass
-
-    engine._release_sam3_npu = _release_keep_weights
-
-
-def _build_engine(config_yaml: str, extra_args: list[str]) -> Any:
+def _build_engine(config_yaml: str, extra_args: list[str], keep_sam3: bool) -> Any:
     """Load VideoPoseInference once. Does not run a job."""
-    import argparse as _argparse
-
-    # motion_control.py lives in the 910b directory; make sure it is importable.
     here = Path(__file__).resolve().parent
     cwd = Path.cwd()
     for p in (here, cwd, here.parent):
@@ -124,97 +94,28 @@ def _build_engine(config_yaml: str, extra_args: list[str]) -> Any:
         if sp not in sys.path:
             sys.path.insert(0, sp)
 
-    import motion_control as mc
+    from motion_control import VideoPoseInference
+    from resident_compat import apply_resident_compat
 
-    parser = None
-    if hasattr(mc, "parse_args"):
-        # Some trees expose parse_args(); we still inject yaml/empty inputs.
-        pass
-    if hasattr(mc, "build_argparser"):
-        parser = mc.build_argparser()
-    elif hasattr(mc, "get_parser"):
-        parser = mc.get_parser()
-
-    ns = None
-    if parser is not None:
-        ns = parser.parse_args(
-            ["--config_yaml", config_yaml, "--input_image", "", "--driving_video", "", *extra_args]
-        )
-    else:
-        ns = _argparse.Namespace(
-            config_yaml=config_yaml,
-            input_image="",
-            driving_video="",
-            prompt="",
-            resident=True,
-        )
-        for i, tok in enumerate(extra_args):
-            if tok.startswith("--") and i + 1 < len(extra_args) and not extra_args[i + 1].startswith("--"):
-                setattr(ns, tok.lstrip("-").replace("-", "_"), extra_args[i + 1])
-
-    if hasattr(mc, "VideoPoseInference"):
-        cls = mc.VideoPoseInference
-        try:
-            engine = cls(ns)
-        except TypeError:
-            engine = cls(config_yaml=config_yaml)
-        return engine
-
-    raise RuntimeError(
-        "motion_control.VideoPoseInference not found. "
-        "Copy serve_resident.py next to motion_control.py, or expose that class."
-    )
+    engine = VideoPoseInference(config_yaml=config_yaml)
+    apply_resident_compat(engine, keep_sam3=keep_sam3)
+    return engine
 
 
 def _run_job(engine: Any, image: str, video: str, prompt: str) -> dict[str, Any]:
-    """Call whatever generate/infer API the current tree has."""
-    for name in ("generate", "infer", "run", "process", "__call__"):
-        fn = getattr(engine, name, None)
-        if not callable(fn) or name == "__call__":
-            continue
-        try:
-            out = fn(image, video, prompt)
-            return _normalize_result(out, image=image, video=video)
-        except TypeError:
-            try:
-                out = fn(input_image=image, driving_video=video, prompt=prompt)
-                return _normalize_result(out, image=image, video=video)
-            except TypeError:
-                continue
-
-    # Fallback: set attributes then call a no-arg run.
-    for attr, val in (
-        ("input_image", image),
-        ("driving_video", video),
-        ("prompt", prompt),
-        ("ref_image", image),
-        ("pose_video", video),
-    ):
-        if hasattr(engine, attr):
-            setattr(engine, attr, val)
-    for name in ("generate", "infer", "run", "process"):
-        fn = getattr(engine, name, None)
-        if callable(fn):
-            out = fn()
-            return _normalize_result(out, image=image, video=video)
-
-    raise RuntimeError(
-        "VideoPoseInference has no reusable generate/infer/run method. "
-        "Add generate(input_image, driving_video, prompt) and skip torchrun relaunch "
-        "when ICS2V_RESIDENT=1."
+    """VideoPoseInference.do_inference(input_image_path, driving_video_path, prompt)."""
+    code, msg, output = engine.do_inference(
+        input_image_path=image,
+        driving_video_path=video,
+        prompt=prompt,
     )
-
-
-def _normalize_result(out: Any, image: str, video: str) -> dict[str, Any]:
-    if isinstance(out, dict):
-        out.setdefault("code", 0)
-        out.setdefault("msg", "success")
-        return out
-    if isinstance(out, str):
-        return {"code": 0, "msg": "success", "output": out, "image": image, "video": video}
-    if out is None:
-        return {"code": 0, "msg": "success", "output": None, "image": image, "video": video}
-    return {"code": 0, "msg": "success", "output": str(out)}
+    return {
+        "code": int(code),
+        "msg": msg,
+        "output": output,
+        "image": image,
+        "video": video,
+    }
 
 
 def worker_main(
@@ -234,8 +135,11 @@ def worker_main(
     )
     try:
         torch, dist = _init_npu(rank, world_size)
-        engine = _build_engine(worker_args["config_yaml"], worker_args.get("extra_args") or [])
-        _maybe_keep_sam3(engine, keep_sam3=bool(worker_args.get("keep_sam3", True)))
+        engine = _build_engine(
+            worker_args["config_yaml"],
+            worker_args.get("extra_args") or [],
+            keep_sam3=bool(worker_args.get("keep_sam3", True)),
+        )
         dist.barrier()
         ready_queue.put(
             {
